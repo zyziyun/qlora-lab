@@ -446,6 +446,131 @@ def build_colab():
     build(cells, NB / "colab_t4_run.ipynb")
 
 
+# =====================================================================
+# colab_serve_vllm - serve the adapter with vLLM on Colab, base-vs-adapter A/B
+# =====================================================================
+def build_colab_serve():
+    cells = [
+        md(
+            "# Serve the adapter with vLLM on Colab: hot-swap A/B in one run\n\n"
+            "**Before running**: Runtime -> Change runtime type -> **T4 or L4 GPU**.\n"
+            "You also need `adapters.zip` (downloaded from `colab_t4_run.ipynb`) on your\n"
+            "local machine.\n\n"
+            "This demonstrates the serving half of the lab: one vLLM server loads the\n"
+            "fp16 base **once** and exposes the LoRA adapter as a second model name\n"
+            "(`ticket`). The client picks base or adapter per request by model name -\n"
+            "that is adapter hot-swapping, the '1 GPU + N small files serves N variants'\n"
+            "story. QLoRA trains on a 4-bit base but serves on the fp16 base; that is\n"
+            "standard practice and the quality delta is negligible."
+        ),
+        code(
+            "# 1. Check what CUDA your driver supports BEFORE installing vllm.\n"
+            "#    Look at 'CUDA Version: X.Y' in the top-right of the output.\n"
+            "!nvidia-smi | head -4"
+        ),
+        md(
+            "### Install vLLM - match the wheel to your CUDA\n"
+            "The #1 self-hosting pitfall is a wheel built for a different CUDA than the\n"
+            "environment (symptom: `ImportError: libcudart.so.13: cannot open shared\n"
+            "object file`). Pick ONE cell below based on the nvidia-smi output:"
+        ),
+        code(
+            "# If CUDA Version showed 13.x: plain install, force torch to match.\n"
+            "%pip install -q --force-reinstall vllm\n"
+            "# Then: Runtime -> Restart session (files survive), rerun from cell 3."
+        ),
+        code(
+            "# If CUDA Version showed 12.x: install the cu128-matched build instead.\n"
+            "# %pip install -q uv\n"
+            "# !uv pip install --system -q vllm --torch-backend=cu128\n"
+            "# Fallback if uv cannot resolve: %pip install -q 'vllm==0.10.2'"
+        ),
+        code(
+            "# 3. Code + data (same seed -> byte-identical test set as training time)\n"
+            "!git clone https://github.com/zyziyun/qlora-lab.git\n"
+            "%cd /content/qlora-lab\n"
+            "!python scripts/make_data.py --n 800\n"
+            "import sys; sys.path.insert(0, 'src')"
+        ),
+        md(
+            "### 4. Upload the adapter\n"
+            "Open the Files pane on the left, drag `adapters.zip` in (anywhere is fine -\n"
+            "the cell below unzips from /content), wait for the upload spinner to finish."
+        ),
+        code(
+            "!unzip -q -o /content/adapters.zip -d /content/qlora-lab\n"
+            "!ls /content/qlora-lab/outputs/"
+        ),
+        code(
+            "# 5. Start the vLLM server in the background.\n"
+            "#    --dtype half is REQUIRED on T4 (no bf16 on Turing); harmless on L4.\n"
+            "#    NOTE: Restart session kills this process - rerun this cell after any restart.\n"
+            "import subprocess, time, requests\n"
+            "\n"
+            "server = subprocess.Popen([\n"
+            "    'vllm', 'serve', 'Qwen/Qwen3-1.7B',\n"
+            "    '--dtype', 'half',\n"
+            "    '--enable-lora',\n"
+            "    '--lora-modules', 'ticket=outputs/adapter-1.7b',\n"
+            "    '--max-lora-rank', '16',\n"
+            "    '--max-model-len', '4096',\n"
+            "    '--gpu-memory-utilization', '0.85',\n"
+            "    '--port', '8000',\n"
+            "], stdout=open('vllm.log', 'w'), stderr=subprocess.STDOUT)\n"
+            "\n"
+            "print('first boot downloads ~3.4GB weights: expect 5-8 min on T4, less after caching')\n"
+            "for i in range(150):\n"
+            "    try:\n"
+            "        if requests.get('http://localhost:8000/v1/models', timeout=2).ok:\n"
+            "            print('server ready'); break\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    time.sleep(5)\n"
+            "else:\n"
+            "    print('not ready - debug with: !tail -50 vllm.log')"
+        ),
+        code(
+            "# 6. The hot-swap proof: one server, two model ids (base + adapter).\n"
+            "!curl -s localhost:8000/v1/models | python3 -m json.tool | grep '\"id\"'"
+        ),
+        code(
+            "# 7. A/B on the same server - the only difference is the model name string.\n"
+            "from qlora_lab import serve, predict, dataset as ds, evaluate as ev\n"
+            "\n"
+            "client = serve.openai_client()\n"
+            "NO_THINK = {'chat_template_kwargs': {'enable_thinking': False}}  # Qwen3: no <think> block\n"
+            "\n"
+            "test = ds.read_jsonl('data/test.jsonl')[:30]\n"
+            "\n"
+            "base_preds  = [predict.extract(client, 'Qwen/Qwen3-1.7B', e['message'], extra_body=NO_THINK) for e in test]\n"
+            "tuned_preds = [predict.extract(client, 'ticket',          e['message'], extra_body=NO_THINK) for e in test]\n"
+            "\n"
+            "rb = ev.evaluate(base_preds,  test, in_price=0.05e-6, out_price=0.20e-6)\n"
+            "rt = ev.evaluate(tuned_preds, test, in_price=0.05e-6, out_price=0.20e-6)\n"
+            "print('BASE :', rb.summary())\n"
+            "print('TUNED:', rt.summary())\n"
+            "print(); print(ev.compare(rb, rt))\n"
+            "print('base failures:', [f['reason'][:30] for f in rb.failures[:5]])"
+        ),
+        code(
+            "# 8. One visible example - base vs adapter on the same message.\n"
+            "msg = 'Hey team, order 55012 arrived smashed and I am furious. Please advise.'\n"
+            "for m in ['Qwen/Qwen3-1.7B', 'ticket']:\n"
+            "    p = predict.extract(client, m, msg, extra_body=NO_THINK)\n"
+            "    print(f'{m:>18}: {p.raw[:110]}')"
+        ),
+        md(
+            "Expected: tuned wins the judgment fields (priority/sentiment) with ~32 output\n"
+            "tokens vs the base's longer output, and latency beats single-request HF\n"
+            "generate thanks to vLLM's continuous batching + PagedAttention. If you serve\n"
+            "the 1.7B in production, pair it with the deterministic guardrail from the\n"
+            "README (extracted order_id must be a substring of the message) and escalate\n"
+            "failures via `agent.route_with_fallback`."
+        ),
+    ]
+    build(cells, NB / "colab_serve_vllm.ipynb")
+
+
 if __name__ == "__main__":
     build_00()
     build_01()
@@ -455,4 +580,5 @@ if __name__ == "__main__":
     build_05()
     build_06()
     build_colab()
+    build_colab_serve()
     print("done")
