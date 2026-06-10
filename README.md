@@ -32,7 +32,38 @@ cost_per_1k_usd         0.700      0.014     -0.686
 cost reduction: 98%
 ```
 
-> Those are stub numbers, deliberately illustrative. The **real** numbers come from notebooks `01` (a true prompting baseline) and `05` (your actual QLoRA adapter served by vLLM). For reference, the literature point this task tends to land on: a small base model prompts at roughly 70% schema validity and a QLoRA fine-tune pushes it past 95%, with self-hosting an order of magnitude cheaper per token than a frontier API. Reproduce it, do not quote it.
+> Those are stub numbers, deliberately illustrative. The real numbers are below.
+
+---
+
+## Headline result (measured, not claimed)
+
+From a real run of `notebooks/colab_t4_run.ipynb` on a Colab L4, 2026-06-10. Same 100-example held-out test set throughout; QLoRA r16/alpha32, all linear layers, 3 epochs (loss plateaus by step ~45 of 216 — 1 epoch would do).
+
+**Finding 1 — modern instruct bases already nail JSON formatting; what degrades at small scale is judgment.** Both bases scored `schema_validity = 1.000` prompted. The convention-dependent fields are where they fail:
+
+| field accuracy (prompted base) | Qwen3-8B | Qwen3-1.7B |
+|---|---:|---:|
+| order_id | 1.00 | 0.98 |
+| issue | 1.00 | 0.95 |
+| sentiment | 0.88 | **0.71** |
+| priority | 0.58 | **0.50** |
+
+`priority = 0.50` is a coin flip: the base model has its own opinion of what "high" means, not ours. That labeling convention is exactly what the fine-tune teaches.
+
+**Finding 2 — after fine-tuning, the 1.7B matches the 8B**, every field at 1.00 on both. So you serve the model 4.7× smaller:
+
+| metric | 1.7B base | 1.7B tuned | Δ |
+|---|---:|---:|---:|
+| priority accuracy | 0.50 | **1.00** | +0.50 |
+| sentiment accuracy | 0.71 | **1.00** | +0.29 |
+| output tokens / query | 56 | **32** | −42% |
+| mean latency (L4) | 2515 ms | **2067 ms** | −18% |
+| cost / 1k queries (same GPU) | $0.018 | $0.013 | −26% |
+
+Trainable parameters on the 1.7B: 17.4M of 1.74B, **1.00% trained** — the LoRA promise, verbatim from the training log.
+
+**Caveats, before you quote this anywhere:** the data is synthetic and the test set is drawn from the same template family as training, so these are in-distribution numbers. A 5-message out-of-distribution spot check (slang, formal register, invoice-vs-order ambiguity, multi-issue messages) parsed 5/5 valid with sensible fields on the 8B adapter. `exact_match = 0.000` for the bases is an artifact — gold summaries are canned template strings the base model can't guess; read `field_accuracy` for the fair base score. The −26% cost figure is base-vs-tuned on the *same* GPU; the order-of-magnitude story is frontier-API-vs-self-hosted, measured in notebook `01`.
 
 ---
 
