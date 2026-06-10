@@ -578,6 +578,191 @@ def build_colab_serve():
     build(cells, NB / "colab_serve_vllm.ipynb")
 
 
+# =====================================================================
+# colab_experiments - the experiment menu, each section a finding
+# =====================================================================
+def build_experiments():
+    cells = [
+        md(
+            "# Experiment menu: each section produces one finding\n\n"
+            "> Runtime -> T4 or L4 GPU. Sections are independent — run the ones you want.\n"
+            "> Training sections take 10-40 min each on a T4; inference sections are quick.\n\n"
+            "Every experiment here maps to a claim you could put in a resume bullet or\n"
+            "defend in an interview. Run it, read the number, keep the table."
+        ),
+        code("%pip install -q unsloth"),
+        code(
+            "!git clone https://github.com/zyziyun/qlora-lab.git\n"
+            "%cd /content/qlora-lab\n"
+            "!python scripts/make_data.py --n 800\n"
+            "import sys; sys.path.insert(0, 'src')"
+        ),
+        code(
+            "# Shared helpers: load an adapter (or base), eval it on a dataset, free VRAM.\n"
+            "import time, torch, gc\n"
+            "from unsloth import FastLanguageModel\n"
+            "from qlora_lab import synth, train, dpo, agent, evaluate as qev, dataset as qds\n"
+            "from qlora_lab.dataset import SYSTEM_PROMPT\n"
+            "from qlora_lab.predict import Prediction\n"
+            "from qlora_lab.schema import Ticket, parse_ticket\n"
+            "\n"
+            "test = qds.read_jsonl('data/test.jsonl')\n"
+            "ood  = synth.gen_ood()           # held-out out-of-distribution set\n"
+            "\n"
+            "def run_eval(model, tokenizer, data, max_new_tokens=96):\n"
+            "    preds = []\n"
+            "    for e in data:\n"
+            "        msgs = [{'role':'system','content':SYSTEM_PROMPT},{'role':'user','content':e['message']}]\n"
+            "        ids = tokenizer.apply_chat_template(msgs, add_generation_prompt=True,\n"
+            "              return_tensors='pt', enable_thinking=False).to(model.device)\n"
+            "        t0=time.perf_counter(); out=model.generate(input_ids=ids, max_new_tokens=max_new_tokens,\n"
+            "              do_sample=False, pad_token_id=tokenizer.eos_token_id); dt=time.perf_counter()-t0\n"
+            "        g=out[0][ids.shape[1]:]\n"
+            "        preds.append(Prediction(raw=tokenizer.decode(g, skip_special_tokens=True),\n"
+            "                     latency_s=dt, prompt_tokens=int(ids.shape[1]), completion_tokens=int(g.shape[0])))\n"
+            "    return preds\n"
+            "\n"
+            "def free(*objs):\n"
+            "    for o in objs:\n"
+            "        del o\n"
+            "    gc.collect(); torch.cuda.empty_cache()\n"
+            "\n"
+            "def eval_adapter(path, data, **kw):\n"
+            "    m, t = FastLanguageModel.from_pretrained(path, max_seq_length=2048, load_in_4bit=True)\n"
+            "    FastLanguageModel.for_inference(m)\n"
+            "    rep = qev.evaluate(run_eval(m, t, data, **kw), data, in_price=0.05e-6, out_price=0.20e-6)\n"
+            "    free(m, t); return rep"
+        ),
+        md(
+            "## A. OOD gap, and whether data diversity closes it (experiment #3)\n"
+            "The shipped 1.7B adapter aces the in-distribution test but slips on unseen\n"
+            "styles. Retrain with `diverse=True` data and re-check the same OOD set."
+        ),
+        code(
+            "# in-distribution vs OOD for the shipped adapter\n"
+            "print('1.7B adapter, in-dist:', eval_adapter('outputs/adapter-1.7b', test).summary())\n"
+            "print('1.7B adapter, OOD    :', eval_adapter('outputs/adapter-1.7b', ood).summary())"
+        ),
+        code(
+            "# train a diverse-data adapter and re-check OOD (~10 min on T4)\n"
+            "div_examples = synth.gen(800, seed=7, diverse=True)\n"
+            "parts = qds.split(div_examples, n_test=100, n_val=100)\n"
+            "tr, _ = qds.decontaminate(parts['train'], parts['test'])\n"
+            "qds.write_jsonl([qds.to_chat(e) for e in tr], 'data/train_diverse.jsonl')\n"
+            "train.train('data/train_diverse.jsonl', train.TrainConfig(\n"
+            "    base_model='unsloth/Qwen3-1.7B-bnb-4bit', output_dir='outputs/adapter-1.7b-diverse'))\n"
+            "print('diverse adapter, OOD :', eval_adapter('outputs/adapter-1.7b-diverse', ood).summary())\n"
+            "# Closed the gap -> diversity beats a bigger model. Still short -> 1.7B capacity ceiling."
+        ),
+        md(
+            "## B. Guardrail: catch hallucinated order ids, measure escalation (experiment #2)\n"
+            "A deterministic check (order_id must be a substring of the message) catches the\n"
+            "dangerous failure the OOD set exposes, and routes only those to a strong model."
+        ),
+        code(
+            "m, t = FastLanguageModel.from_pretrained('outputs/adapter-1.7b', max_seq_length=2048, load_in_4bit=True)\n"
+            "FastLanguageModel.for_inference(m)\n"
+            "caught = 0\n"
+            "for e in ood:\n"
+            "    p = run_eval(m, t, [e])[0]\n"
+            "    tk, _ = parse_ticket(p.raw)\n"
+            "    if tk and not agent.order_id_in_message(tk, e['message']):\n"
+            "        caught += 1\n"
+            "        print('GUARD CAUGHT:', repr(e['message'][:60]), '-> claimed', tk.order_id)\n"
+            "print(f'\\nwould escalate {caught}/{len(ood)} = {caught/len(ood):.0%} to the strong model')\n"
+            "print('at a 20x price gap, routing cost vs all-strong =', round((len(ood)+caught*20)/(len(ood)*20), 2))\n"
+            "free(m, t)"
+        ),
+        md(
+            "## C. Data scaling curve (experiment #4)\n"
+            "How many labeled examples does this narrow task actually need? Train on\n"
+            "increasing slices, eval each on the same test set."
+        ),
+        code(
+            "import json\n"
+            "full = qds.read_jsonl('data/train.jsonl')\n"
+            "rows = []\n"
+            "for k in [50, 150, 300, len(full)]:\n"
+            "    qds.write_jsonl(full[:k], f'data/train_{k}.jsonl')\n"
+            "    train.train(f'data/train_{k}.jsonl', train.TrainConfig(\n"
+            "        base_model='unsloth/Qwen3-1.7B-bnb-4bit', epochs=1, output_dir=f'outputs/scale-{k}'))\n"
+            "    r = eval_adapter(f'outputs/scale-{k}', test)\n"
+            "    rows.append((k, r.schema_validity, r.field_accuracy['priority'], r.exact_match))\n"
+            "    print(f'n={k:>4}  validity={r.schema_validity:.3f}  priority={r.field_accuracy[\"priority\"]:.3f}  exact={r.exact_match:.3f}')\n"
+            "print('\\nwhere the curve flattens is how much data you actually needed')"
+        ),
+        md(
+            "## D. Rank ablation (experiment #6)\n"
+            "Is r8 really within 1-2% of r64 on your task? Verify, do not assume."
+        ),
+        code(
+            "for r in [8, 16, 64]:\n"
+            "    train.train('data/train.jsonl', train.TrainConfig(\n"
+            "        base_model='unsloth/Qwen3-1.7B-bnb-4bit', lora_r=r, lora_alpha=2*r, epochs=1,\n"
+            "        output_dir=f'outputs/rank-{r}'))\n"
+            "    rep = eval_adapter(f'outputs/rank-{r}', test)\n"
+            "    print(f'r={r:>2}  validity={rep.schema_validity:.3f}  exact={rep.exact_match:.3f}  priority={rep.field_accuracy[\"priority\"]:.3f}')"
+        ),
+        md(
+            "## E. Multi-base benchmark (experiment #7)\n"
+            "The resume's *benchmarking Qwen3, LLaMA3, Gemma* — same data, swap the base,\n"
+            "pick the Pareto point. (Each base downloads a few GB the first time.)"
+        ),
+        code(
+            "for base in ['unsloth/Qwen3-1.7B-bnb-4bit', 'unsloth/Llama-3.2-3B-bnb-4bit']:\n"
+            "    tag = base.split('/')[-1]\n"
+            "    train.train('data/train.jsonl', train.TrainConfig(base_model=base, epochs=1, output_dir=f'outputs/{tag}'))\n"
+            "    rep = eval_adapter(f'outputs/{tag}', test)\n"
+            "    print(f'{tag:>26}  validity={rep.schema_validity:.3f}  exact={rep.exact_match:.3f}  out_tok={rep.mean_completion_tokens:.0f}')"
+        ),
+        md(
+            "## F. Detailed summaries (experiment #5)\n"
+            "The dual of 'the model learns your data's shape': feed summaries that carry the\n"
+            "order id and key fact, and the tuned model emits detailed summaries too."
+        ),
+        code(
+            "det = synth.gen(800, seed=7, detailed_summary=True)\n"
+            "p = qds.split(det, n_test=100, n_val=100); tr,_ = qds.decontaminate(p['train'], p['test'])\n"
+            "qds.write_jsonl([qds.to_chat(e) for e in tr], 'data/train_detailed.jsonl')\n"
+            "train.train('data/train_detailed.jsonl', train.TrainConfig(\n"
+            "    base_model='unsloth/Qwen3-1.7B-bnb-4bit', epochs=1, output_dir='outputs/adapter-detailed'))\n"
+            "m,t = FastLanguageModel.from_pretrained('outputs/adapter-detailed', max_seq_length=2048, load_in_4bit=True)\n"
+            "FastLanguageModel.for_inference(m)\n"
+            "print(run_eval(m, t, [p['test'][0]])[0].raw)\n"
+            "free(m, t)"
+        ),
+        md(
+            "## G. DPO second stage (experiment #9)\n"
+            "SFT makes it correct; DPO makes it prefer the compact prose-free style over a\n"
+            "chatty fenced one. Watch output tokens drop with no loss of validity."
+        ),
+        code(
+            "# preference pairs: chosen = compact JSON, rejected = chatty fenced JSON\n"
+            "import json\n"
+            "pairs = dpo.make_preference_pairs(qds.read_jsonl('data/test.jsonl')[:200] if False else synth.gen(400, seed=11))\n"
+            "with open('data/prefs.jsonl','w') as f:\n"
+            "    for r in pairs: f.write(json.dumps(r)+'\\n')\n"
+            "dpo.train_dpo('data/prefs.jsonl', base_model='unsloth/Qwen3-1.7B-bnb-4bit',\n"
+            "    cfg=dpo.DPOConfig(sft_adapter='outputs/adapter-1.7b', output_dir='outputs/adapter-dpo'))\n"
+            "print('SFT  :', eval_adapter('outputs/adapter-1.7b', test).summary())\n"
+            "print('DPO  :', eval_adapter('outputs/adapter-dpo', test).summary())\n"
+            "# expect similar validity, fewer output tokens, zero preambles"
+        ),
+        md(
+            "## H. vLLM concurrency (experiment #8)\n"
+            "Lives in `colab_serve_vllm.ipynb` (needs a running server). The snippet: send N\n"
+            "requests through a ThreadPoolExecutor and compare throughput to serial — the\n"
+            "gap is vLLM's continuous batching + PagedAttention, the S4 goodput story made real.\n"
+            "```python\n"
+            "from concurrent.futures import ThreadPoolExecutor\n"
+            "with ThreadPoolExecutor(max_workers=30) as ex:\n"
+            "    out = list(ex.map(lambda e: predict.extract(client,'ticket',e['message'],extra_body=NO_THINK), test))\n"
+            "```"
+        ),
+    ]
+    build(cells, NB / "colab_experiments.ipynb")
+
+
 if __name__ == "__main__":
     build_00()
     build_01()
@@ -588,4 +773,5 @@ if __name__ == "__main__":
     build_06()
     build_colab()
     build_colab_serve()
+    build_experiments()
     print("done")
