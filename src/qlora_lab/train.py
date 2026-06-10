@@ -41,9 +41,13 @@ def train(train_jsonl: str, cfg: TrainConfig = TrainConfig()) -> str:
     one {"messages": [...]} record per line. We let TRL apply the chat template
     and, crucially, mask the loss to the assistant turn only.
     """
+    import torch  # noqa: PLC0415
     from datasets import load_dataset  # noqa: PLC0415
     from trl import SFTConfig, SFTTrainer  # noqa: PLC0415
     from unsloth import FastLanguageModel  # noqa: PLC0415
+
+    # T4 (Turing) has no bf16; hardcoding bf16=True errors there. Detect instead.
+    bf16_ok = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=cfg.base_model,
@@ -85,7 +89,8 @@ def train(train_jsonl: str, cfg: TrainConfig = TrainConfig()) -> str:
             learning_rate=cfg.learning_rate,
             warmup_steps=cfg.warmup_steps,
             lr_scheduler_type="cosine",
-            bf16=True,
+            bf16=bf16_ok,
+            fp16=not bf16_ok,
             logging_steps=5,
             output_dir=cfg.output_dir,
             dataset_text_field="text",
