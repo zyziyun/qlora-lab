@@ -24,12 +24,19 @@ class Prediction:
     completion_tokens: int
 
 
-def extract(client, model: str, message: str, temperature: float = 0.0) -> Prediction:
+def extract(
+    client, model: str, message: str, temperature: float = 0.0, extra_body: dict | None = None
+) -> Prediction:
     """Run one extraction against an OpenAI-compatible `client`.
 
     `client` is an `openai.OpenAI(...)` pointed at any base_url: api.openai.com for
     a frontier baseline, or http://localhost:8000/v1 for a local vLLM serving the
     base model or a LoRA adapter (selected by `model`).
+
+    `extra_body` passes provider-specific options through. The one that matters
+    here: vLLM-served Qwen3 has thinking mode on by default, which emits a long
+    <think> block before the JSON. Disable it with
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}}.
     """
     t0 = time.perf_counter()
     resp = client.chat.completions.create(
@@ -39,6 +46,7 @@ def extract(client, model: str, message: str, temperature: float = 0.0) -> Predi
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": message},
         ],
+        extra_body=extra_body,
     )
     dt = time.perf_counter() - t0
     usage = resp.usage
