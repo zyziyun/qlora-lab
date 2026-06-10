@@ -16,6 +16,10 @@ NB = Path(__file__).parent.parent / "notebooks"
 
 def build(cells, path: Path):
     nb = nbf.v4.new_notebook()
+    # deterministic cell ids: nbformat randomizes them per call, which would
+    # dirty every notebook on every rebuild
+    for i, c in enumerate(cells):
+        c["id"] = f"cell-{i}"
     nb["cells"] = cells
     nb["metadata"] = {
         "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
@@ -493,13 +497,16 @@ def build_colab_serve():
             "import sys; sys.path.insert(0, 'src')"
         ),
         md(
-            "### 4. Upload the adapter\n"
-            "Open the Files pane on the left, drag `adapters.zip` in (anywhere is fine -\n"
-            "the cell below unzips from /content), wait for the upload spinner to finish."
+            "### 4. The adapter is already here\n"
+            "The 1.7B adapter ships with the repo (`outputs/adapter-1.7b`, 67MB), so the\n"
+            "clone in step 3 brought it along - nothing to upload. The 8B adapter exceeds\n"
+            "GitHub's 100MB file limit and is not bundled; only if you want to A/B it too,\n"
+            "drag your `adapters.zip` into the Files pane and run the optional cell below."
         ),
         code(
-            "!unzip -q -o /content/adapters.zip -d /content/qlora-lab\n"
-            "!ls /content/qlora-lab/outputs/"
+            "!ls outputs/adapter-1.7b/\n"
+            "# Optional, 8B adapter from a local adapters.zip:\n"
+            "# !unzip -q -o /content/adapters.zip -d /content/qlora-lab"
         ),
         code(
             "# 5. Start the vLLM server in the background.\n"
