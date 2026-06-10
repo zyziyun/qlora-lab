@@ -1,0 +1,18 @@
+# Core (CPU, no GPU) -- data, schema, evaluation, agent wiring.
+pydantic>=2.6
+openai>=1.40
+
+# Training + serving (GPU, install on Colab/T4 or a CUDA box).
+# Pinned loosely; Unsloth tracks fast-moving PyTorch/transformers versions.
+# Uncomment on a GPU machine:
+# unsloth>=2026.1
+# trl>=0.12
+# peft>=0.13
+# transformers>=4.46
+# datasets>=3.0
+# accelerate>=1.0
+# bitsandbytes>=0.44
+# vllm>=0.6   # adapter serving
+
+# Notebooks / tooling
+nbformat>=5.10
