@@ -1,6 +1,6 @@
 # qlora-lab
 
-A hands-on, production-grade QLoRA fine-tuning lab built around one narrow, high-frequency task: turning a free-text customer-support message into a strict JSON ticket. Seven notebooks walk from *should you even fine-tune* through data prep, QLoRA training on a free Colab T4, vLLM adapter serving, a base-vs-fine-tuned comparison, and plugging the tuned model into an agent as a cheap sub-model.
+A hands-on, production-grade QLoRA fine-tuning lab built around one narrow, high-frequency task: turning a free-text customer-support message into a strict JSON ticket. Nine notebooks walk from *should you even fine-tune* through data prep, QLoRA training on a free Colab T4, vLLM adapter serving, a base-vs-fine-tuned comparison, and plugging the tuned model into an agent as a cheap sub-model. A trained 1.7B adapter ships with the repo, so you can serve and A/B it without training anything first.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11](https://img.shields.io/badge/python-3.11-blue.svg)](https://www.python.org/downloads/)
@@ -85,7 +85,10 @@ python scripts/build_notebooks.py
 # 4. Open notebooks/00_quickstart.ipynb — runs end to end offline in ~5 min
 ```
 
-Training (notebook `03`) and serving (`04`) need a GPU. The fastest path is **`notebooks/colab_t4_run.ipynb`**: open it in Colab, pick a T4 runtime, Run all — it clones the repo, measures the raw base, trains the QLoRA adapter, prints the base-vs-tuned table, and downloads the adapter, in roughly 30-50 minutes.
+Training and serving need a GPU. Two self-contained Colab paths, both verified end to end:
+
+- **Train + compare**: `notebooks/colab_t4_run.ipynb` — pick a T4/L4 runtime, Run all. Clones the repo, measures the raw base, trains the QLoRA adapter, prints the base-vs-tuned table, downloads the adapter. ~30-50 min on T4, ~20 min on L4.
+- **Serve + hot-swap A/B** (no training needed): `notebooks/colab_serve_vllm.ipynb` — the bundled `outputs/adapter-1.7b` is hot-swapped onto the fp16 base by one vLLM server; the client picks base or adapter per request by model name. Includes the CUDA-wheel-matching install cells, because `ImportError: libcudart.so.13` is the #1 self-hosting pitfall and you should meet it here, not in production.
 
 ---
 
@@ -103,12 +106,26 @@ Each module is short enough to read in one sitting. Map them to the S7 handout:
 | 6 | `src/qlora_lab/serve.py` + `notebooks/04` | 四 merge vs vLLM adapter hot-swap |
 | 7 | `src/qlora_lab/evaluate.py` + `notebooks/05` | 五 base vs fine-tuned: validity, cost, latency |
 | 8 | `src/qlora_lab/agent.py` + `notebooks/06` | 六 use it as an agent sub-model with fallback routing |
+| 9 | `notebooks/colab_t4_run.ipynb` | the whole train + compare loop, one Run all |
+| 10 | `notebooks/colab_serve_vllm.ipynb` | vLLM hot-swap serving, base-vs-adapter A/B |
 
 ## How to use it
 
 - **First pass**: run notebook `00` offline, then `01` against a real model to get an honest baseline.
-- **Second pass**: on a T4, run `02` → `03` → `04` → `05` and read the real base-vs-tuned table off your own run.
+- **Second pass**: open `colab_t4_run.ipynb` on a T4/L4, Run all, and read the real base-vs-tuned table off your own run.
+- **Third pass**: open `colab_serve_vllm.ipynb` and serve the adapter with vLLM — same numbers, production-shaped stack.
 - **Make it yours**: replace `synth.gen` with a loader for your own labeled data; nothing downstream changes. Swap the task schema in `schema.py` and you have a fine-tuning lab for any structured-extraction problem.
+
+**Experiments worth running next** (each one produced a finding above):
+
+| Experiment | How | What it tells you |
+|---|---|---|
+| OOD spot check | feed hand-written off-template messages to the tuned model | whether it learned the task or the templates |
+| Specialization gate | query the tuned model *without* the extraction system prompt | LoRA adds a prompt-gated behavior, base ability intact |
+| 1 epoch vs 3 | `TrainConfig(epochs=1)` | loss plateaus by step ~45; watch curves, not epoch counts |
+| Rank ablation | r8 vs r16 vs r64 | is r8 really within 1-2% on your task |
+| Multi-base benchmark | swap `base_model`, keep data fixed | pick the Pareto point, not the biggest model |
+| Frontier baseline | notebook `01` with an API key | the order-of-magnitude cost story vs self-hosting |
 
 ## Layout
 
@@ -124,7 +141,10 @@ src/qlora_lab/
   agent.py      tuned model as a sub-model, cheap-first routing with fallback
 scripts/
   make_data.py        generate data/*.jsonl
-  build_notebooks.py  emit notebooks/
+  build_notebooks.py  emit notebooks/ (deterministic cell ids, rebuilds are byte-identical)
+notebooks/            00-06 concepts + colab_t4_run (train) + colab_serve_vllm (serve)
+outputs/
+  adapter-1.7b/       trained QLoRA adapter, ships with the repo (67MB)
 ```
 
 ## Honest scope
