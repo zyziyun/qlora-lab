@@ -3,7 +3,11 @@ __pycache__/
 .env
 .venv/
 venv/
-outputs/
+# outputs are local artifacts, except the shipped 1.7B adapter (67MB, used by
+# the serving notebook). The 8B adapter exceeds GitHub's 100MB file limit.
+outputs/*
+!outputs/adapter-1.7b
+outputs/adapter-1.7b/checkpoint-*
 *.csv
 data/*.jsonl
 .ipynb_checkpoints/
